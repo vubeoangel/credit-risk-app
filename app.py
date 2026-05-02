@@ -547,6 +547,27 @@ with tab_cost:
         unsafe_allow_html=True,
     )
 
+    # ── Threshold explanation box ──────────────────────────────────────────
+    with st.expander("📖  Why t* differs across models — read this first", expanded=False):
+        st.markdown(f"""
+        There are **3 different threshold concepts** in this app — they are NOT the same thing:
+
+        | | Value | What it is |
+        |---|---|---|
+        | **Theoretical t\\*** | `{1/(1+COST_RATIO):.3f}` | Bayes-optimal formula: `C_FP / (C_FP + C_FN)`. Assumes perfect model calibration. |
+        | **Empirical t\\*** (raw model) | `~0.001` | Sweep result on the **raw imbalanced model** (no SMOTE, no tuning). Low because class imbalance biases probability outputs downward. |
+        | **Empirical t\\*** (tuned model) | `~0.143` | Sweep result on the **GridSearchCV + SMOTE model**. SMOTE balances training data → probabilities are better calibrated → t\\* moves closer to the theoretical value. |
+
+        **Why the tuned model shows lower total cost ($51k) vs raw model ($290k):**
+        The tuned LightGBM (ROC-AUC = 0.9994) is a dramatically better classifier.
+        Even at t = 0.50 it already makes very few errors. The raw model needs aggressive
+        threshold lowering to catch defaulters that it naturally misses.
+
+        **The cost savings % is lower (27% vs 70%) because:**
+        The tuned model is already near-optimal at t = 0.50. Threshold tuning helps the most
+        for weaker, poorly-calibrated models.
+        """)
+
     sc1, sc2 = st.columns([1.5, 1])
     with sc1:
         cost_model = st.selectbox("Model", list(MODEL_KEYS.keys()), key="cost_model")
@@ -581,18 +602,19 @@ with tab_cost:
 
         # ── KPI strip ─────────────────────────────────────────────────────
         k1, k2, k3, k4, k5 = st.columns(5)
-        for col, val, label, color in [
-            (k1, f"${half_cost:,.0f}", "Cost at t = 0.50",  PAL["red"]),
-            (k2, f"${opt_cost:,.0f}",  "Min Cost (t*)",      PAL["green"]),
-            (k3, f"{saving:.1f}%",     "Cost Saved",         PAL["yellow"]),
-            (k4, f"t* = {opt_t:.3f}", "Optimal Threshold",   PAL["blue"]),
-            (k5, f"{auc_val:.4f}",     "ROC-AUC",            PAL["purple"]),
+        for col, val, label, sublabel, color in [
+            (k1, f"${half_cost:,.0f}", "Cost at t = 0.50",        "standard threshold",         PAL["red"]),
+            (k2, f"${opt_cost:,.0f}",  "Min Cost",                 f"at empirical t* = {opt_t:.3f}", PAL["green"]),
+            (k3, f"{saving:.1f}%",     "Cost Saved",               "vs standard t = 0.50",       PAL["yellow"]),
+            (k4, f"t* = {opt_t:.3f}", "Empirical Optimal t*",      f"theory: {1/(1+COST_RATIO):.3f}", PAL["blue"]),
+            (k5, f"{auc_val:.4f}",     "ROC-AUC",                  "on reconstructed test set",  PAL["purple"]),
         ]:
             col.markdown(f"""
             <div class="card" style="text-align:center;margin-bottom:6px">
               <div style="font-family:'IBM Plex Mono',monospace;font-size:20px;
                           font-weight:700;color:{color}">{val}</div>
-              <div style="font-size:10px;color:#718096;margin-top:4px">{label}</div>
+              <div style="font-size:10px;color:#718096;margin-top:3px">{label}</div>
+              <div style="font-size:9px;color:#4a5568;margin-top:1px;font-style:italic">{sublabel}</div>
             </div>""", unsafe_allow_html=True)
 
         st.divider()
