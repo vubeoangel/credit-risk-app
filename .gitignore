@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large model files (regenerate from training notebook)
+# Random Forest excluded — 52MB (tuned) + 35MB (baseline) exceed practical limits
+models/tuned_random_forest.pkl
+models/baseline_random_forest.pkl
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
