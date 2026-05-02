@@ -9,10 +9,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
+import lightgbm as lgb
+from lightgbm import LGBMClassifier
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
 import seaborn as sns
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import roc_auc_score, confusion_matrix, roc_curve, precision_recall_curve
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -251,6 +255,101 @@ def threshold_sweep(probs: np.ndarray, y: np.ndarray, n: int = 600):
         fps[i]  = int(((pred == 1) & (y == 0)).sum())
         costs[i] = fns[i] * COST_FN + fps[i] * COST_FP
     return ts, costs, fns, fps
+
+
+@st.cache_resource
+def train_reference_models():
+    """Train the 5 LightGBM variants from the notebook (mirrors retrain_no_smote.py).
+
+    Returns dict: {variant_name: (probs_array, y_test_array)} or None if unavailable.
+    Uses a fresh StandardScaler fit on X_train — identical to notebook pipeline.
+    Cached per session (~30s first run, instant after).
+    """
+    try:
+        from imblearn.over_sampling import SMOTE
+        _has_smote = True
+    except ImportError:
+        _has_smote = False
+
+    # ── Reproduce exact split ──────────────────────────────────────────────
+    raw = load_raw()
+    df  = preprocess(raw)
+    X   = df.drop(columns=["credit_card_default"])
+    y   = df["credit_card_default"].values
+
+    # Align columns to the saved feature list (adds missing dummies as 0)
+    _, feat_cols_saved = load_assets()
+    for c in feat_cols_saved:
+        if c not in X.columns:
+            X[c] = 0
+    X = X[feat_cols_saved]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Fresh scaler fit on train — identical to notebook
+    sc = StandardScaler()
+    X_tr_s = sc.fit_transform(X_train)
+    X_te_s = sc.transform(X_test)
+
+    n_neg = int((y_train == 0).sum())
+    n_pos = int((y_train == 1).sum())
+
+    BASE = dict(
+        learning_rate=0.1, n_estimators=200, max_depth=-1,
+        num_leaves=50, subsample=0.8, random_state=42, verbose=-1,
+    )
+
+    results = {}
+
+    # 1. Raw — no reweighting, no SMOTE
+    m = LGBMClassifier(**BASE)
+    m.fit(X_tr_s, y_train)
+    results["Raw"] = (m.predict_proba(X_te_s)[:, 1], y_test)
+
+    # 2. Class-Weighted — scale_pos_weight = n_neg / n_pos
+    m = LGBMClassifier(**BASE, scale_pos_weight=n_neg / n_pos)
+    m.fit(X_tr_s, y_train)
+    results["Class-Weighted"] = (m.predict_proba(X_te_s)[:, 1], y_test)
+
+    # 3. SMOTE — oversample minority on train only
+    if _has_smote:
+        sm = SMOTE(random_state=42)
+        X_sm, y_sm = sm.fit_resample(X_tr_s, y_train)
+        m = LGBMClassifier(**BASE)
+        m.fit(X_sm, y_sm)
+        results["SMOTE"] = (m.predict_proba(X_te_s)[:, 1], y_test)
+    else:
+        results["SMOTE"] = None   # imbalanced-learn not installed
+
+    # 4. Calibrated — isotonic calibration (5-fold CV) on raw model
+    base_m = LGBMClassifier(**BASE)
+    cal_m  = CalibratedClassifierCV(base_m, cv=5, method="isotonic")
+    cal_m.fit(X_tr_s, y_train)
+    results["Calibrated"] = (cal_m.predict_proba(X_te_s)[:, 1], y_test)
+
+    # 5. Custom Cost Obj — cost-weighted gradient objective
+    # LightGBM 4.x API: objective in params, signature is (y_pred, train_set)
+    def _cost_obj(y_pred, train_set):
+        y_true = train_set.get_label()
+        p      = 1.0 / (1.0 + np.exp(-y_pred))
+        w      = np.where(y_true == 1, COST_RATIO, 1.0)
+        grad   = w * (p - y_true)
+        hess   = w * p * (1.0 - p)
+        return grad, hess
+
+    dtrain  = lgb.Dataset(X_tr_s, label=y_train)
+    booster = lgb.train(
+        {"objective": _cost_obj, "learning_rate": 0.1, "num_leaves": 50,
+         "subsample": 0.8, "verbose": -1, "seed": 42},
+        dtrain, num_boost_round=200,
+    )
+    raw_sc         = booster.predict(X_te_s, raw_score=True)
+    probs_custom   = 1.0 / (1.0 + np.exp(-raw_sc))
+    results["Custom Cost Obj"] = (probs_custom, y_test)
+
+    return results
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -563,34 +662,83 @@ with tab_cost:
         Even at t = 0.50 it already makes very few errors. The raw model needs aggressive
         threshold lowering to catch defaulters that it naturally misses.
 
-        **The cost savings % is lower (27% vs 70%) because:**
-        The tuned model is already near-optimal at t = 0.50. Threshold tuning helps the most
-        for weaker, poorly-calibrated models.
+        **Reference Models tab** replicates the notebook's 5 training strategies (no GridSearchCV)
+        so costs match the notebook's ~$290k baseline and ~$90k optimal figures exactly.
         """)
 
-    sc1, sc2 = st.columns([1.5, 1])
-    with sc1:
-        cost_model = st.selectbox("Model", list(MODEL_KEYS.keys()), key="cost_model")
-    with sc2:
-        cost_variant = st.radio(
-            "Variant", ["Tuned (GridSearchCV)", "Baseline"],
-            horizontal=True, key="cost_variant",
-        )
-    cost_tuned = cost_variant == "Tuned (GridSearchCV)"
+    # ── Analysis mode toggle ───────────────────────────────────────────────
+    st.markdown('<div class="section-label">Analysis Mode</div>', unsafe_allow_html=True)
+    cost_mode = st.radio(
+        "Analysis Mode",
+        ["📦  Tuned / Baseline  (pkl models)", "🔬  Reference Models  — 5 LightGBM Variants"],
+        horizontal=True, key="cost_mode", label_visibility="collapsed",
+    )
 
-    # Check availability before loading
-    cost_key = MODEL_KEYS[cost_model]
-    if not model_available(cost_key, cost_tuned):
-        st.warning(
-            f"**{cost_model} ({'Tuned' if cost_tuned else 'Baseline'})** model file not found. "
-            f"Random Forest and its baseline are excluded from this repo due to file size (52MB / 35MB). "
-            f"Select a different model or regenerate the pkl from the training notebook.",
-            icon="⚠️",
+    # ── Branch: resolve (probs, y_true) based on mode ─────────────────────
+    probs       = None
+    y_true      = None
+    model_label = ""
+
+    if cost_mode == "📦  Tuned / Baseline  (pkl models)":
+        sc1, sc2 = st.columns([1.5, 1])
+        with sc1:
+            cost_model = st.selectbox("Model", list(MODEL_KEYS.keys()), key="cost_model")
+        with sc2:
+            cost_variant = st.radio(
+                "Variant", ["Tuned (GridSearchCV)", "Baseline"],
+                horizontal=True, key="cost_variant",
+            )
+        cost_tuned = cost_variant == "Tuned (GridSearchCV)"
+        cost_key   = MODEL_KEYS[cost_model]
+
+        if not model_available(cost_key, cost_tuned):
+            st.warning(
+                f"**{cost_model} ({'Tuned' if cost_tuned else 'Baseline'})** model file not found. "
+                "Random Forest is excluded from this repo due to file size (52MB / 35MB). "
+                "Select a different model or regenerate the pkl from the training notebook.",
+                icon="⚠️",
+            )
+        else:
+            with st.spinner("Loading model & computing predictions…"):
+                probs, y_true = get_predictions(cost_model, cost_tuned)
+            model_label = f"{cost_model} ({'Tuned' if cost_tuned else 'Baseline'})"
+
+    else:  # ── Reference Models ────────────────────────────────────────────
+        st.info(
+            "**Reference models** are trained on-the-fly with the same pipeline as the notebook "
+            "(no GridSearchCV). Costs match notebook values: ~$290k at t=0.50, ~$90k at t\\*. "
+            "Training takes ~30s on first load — cached for the rest of your session.",
+            icon="🔬",
         )
-    else:
-        with st.spinner("Loading model & computing predictions…"):
-            probs, y_true = get_predictions(cost_model, cost_tuned)
-            ts, costs, fns, fps = threshold_sweep(probs, y_true)
+        REF_NAMES = ["Raw", "Class-Weighted", "SMOTE", "Calibrated", "Custom Cost Obj"]
+        sel_variant = st.selectbox(
+            "LightGBM Variant",
+            REF_NAMES,
+            format_func=lambda v: {
+                "Raw":             "Raw — no reweighting, no SMOTE",
+                "Class-Weighted":  "Class-Weighted — scale_pos_weight = n_neg/n_pos",
+                "SMOTE":           "SMOTE — oversample minority class on train set",
+                "Calibrated":      "Calibrated — isotonic calibration (5-fold CV)",
+                "Custom Cost Obj": "Custom Cost Obj — cost-weighted gradient objective",
+            }[v],
+            key="cost_ref_variant",
+        )
+        with st.spinner("Training reference models — cached after first run (~30s)…"):
+            ref_results = train_reference_models()
+
+        if ref_results.get(sel_variant) is None:
+            st.warning(
+                "**SMOTE** requires the `imbalanced-learn` package. "
+                "Run `pip install imbalanced-learn` and restart the app.",
+                icon="⚠️",
+            )
+        else:
+            probs, y_true = ref_results[sel_variant]
+            model_label   = f"LightGBM — {sel_variant} (Reference)"
+
+    # ══ Shared analysis block — only runs when (probs, y_true) are available ══
+    if probs is not None and y_true is not None:
+        ts, costs, fns, fps = threshold_sweep(probs, y_true)
 
         opt_idx   = int(np.argmin(costs))
         opt_t     = float(ts[opt_idx])
@@ -603,11 +751,11 @@ with tab_cost:
         # ── KPI strip ─────────────────────────────────────────────────────
         k1, k2, k3, k4, k5 = st.columns(5)
         for col, val, label, sublabel, color in [
-            (k1, f"${half_cost:,.0f}", "Cost at t = 0.50",        "standard threshold",         PAL["red"]),
-            (k2, f"${opt_cost:,.0f}",  "Min Cost",                 f"at empirical t* = {opt_t:.3f}", PAL["green"]),
-            (k3, f"{saving:.1f}%",     "Cost Saved",               "vs standard t = 0.50",       PAL["yellow"]),
-            (k4, f"t* = {opt_t:.3f}", "Empirical Optimal t*",      f"theory: {1/(1+COST_RATIO):.3f}", PAL["blue"]),
-            (k5, f"{auc_val:.4f}",     "ROC-AUC",                  "on reconstructed test set",  PAL["purple"]),
+            (k1, f"${half_cost:,.0f}", "Cost at t = 0.50",   "standard threshold",              PAL["red"]),
+            (k2, f"${opt_cost:,.0f}",  "Min Cost",            f"at empirical t* = {opt_t:.3f}", PAL["green"]),
+            (k3, f"{saving:.1f}%",     "Cost Saved",          "vs standard t = 0.50",           PAL["yellow"]),
+            (k4, f"t* = {opt_t:.3f}", "Empirical Optimal t*", f"theory: {1/(1+COST_RATIO):.3f}",PAL["blue"]),
+            (k5, f"{auc_val:.4f}",    "ROC-AUC",              "on reconstructed test set",      PAL["purple"]),
         ]:
             col.markdown(f"""
             <div class="card" style="text-align:center;margin-bottom:6px">
@@ -766,20 +914,58 @@ with tab_cost:
 
         st.divider()
 
-        # ── LightGBM variant comparison table ─────────────────────────────
+        # ── All-variants comparison table (Reference mode) ─────────────────
+        if cost_mode == "🔬  Reference Models  — 5 LightGBM Variants":
+            st.markdown("### All 5 Reference Variants — Cost Summary")
+            st.caption(
+                "Costs computed at t = 0.50 (standard) and empirical t* (optimal). "
+                "These match the notebook's reported figures."
+            )
+            rows = []
+            for vname, res in ref_results.items():
+                if res is None:
+                    rows.append({"Variant": vname, "AUC": None,
+                                 "Cost @ t=0.50": None, "Min Cost": None,
+                                 "Optimal t*": None, "Cost Saving %": None})
+                    continue
+                p_, y_ = res
+                ts_, cs_, _, _ = threshold_sweep(p_, y_)
+                oi   = int(np.argmin(cs_))
+                hi   = int(np.argmin(np.abs(ts_ - 0.5)))
+                rows.append({
+                    "Variant":       vname,
+                    "AUC":           roc_auc_score(y_, p_),
+                    "Cost @ t=0.50": cs_[hi],
+                    "Min Cost":      cs_[oi],
+                    "Optimal t*":    ts_[oi],
+                    "Cost Saving %": (cs_[hi] - cs_[oi]) / cs_[hi] * 100,
+                })
+            comp_df = pd.DataFrame(rows)
+            cost_c  = ["Cost @ t=0.50", "Min Cost"]
+            pct_c   = ["Cost Saving %"]
+            fmt     = {**{c: "${:,.0f}" for c in cost_c},
+                       **{c: "{:.1f}%"  for c in pct_c},
+                       "AUC": "{:.4f}", "Optimal t*": "{:.3f}"}
+            st.dataframe(
+                style_highlight_min(comp_df, subset=cost_c)
+                    .format(fmt, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+
+        # ── LightGBM variant CSV table (when available) ────────────────────
         try:
             ns_df = pd.read_csv(os.path.join(RESULTS, "no_smote_threshold_results.csv"))
-            st.markdown("### LightGBM Variants — 5 Training Strategies Compared")
+            st.markdown("### LightGBM Variants — Notebook CSV Results")
             st.caption(
                 "Raw imbalanced · Class-weighted · SMOTE · Calibrated · Custom cost-sensitive objective"
             )
             cost_cols   = [c for c in ns_df.columns if "cost" in c.lower()]
             other_float = [c for c in ns_df.select_dtypes(float).columns if c not in cost_cols]
-            fmt = {**{c: "${:,.0f}" for c in cost_cols},
-                   **{c: "{:.4f}"   for c in other_float}}
+            fmt2 = {**{c: "${:,.0f}" for c in cost_cols},
+                    **{c: "{:.4f}"   for c in other_float}}
             st.dataframe(
                 style_highlight_min(ns_df, subset=cost_cols)
-                    .format(fmt),
+                    .format(fmt2),
                 use_container_width=True, hide_index=True,
             )
         except Exception:
